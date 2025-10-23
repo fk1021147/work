@@ -1,0 +1,34 @@
+import win32com.client as win32
+import time
+
+# Launch or get running CANoe instance
+app = win32.Dispatch("CANoe.Application")        # ProgID for CANoe
+measurement = app.Measurement
+capl = app.CAPL
+
+# Optional: load a configuration (replace path)
+# app.Open("C:\\Path\\To\\Your\\Config.cfg")
+
+# Start measurement
+if not measurement.Running:
+    measurement.Start()
+    # Wait until started
+    while not measurement.Running:
+        time.sleep(0.1)
+
+print("Measurement is running.")
+
+# Call a CAPL function (define it in your CAPL program)
+# Example CAPL signature: void sendDiagRequest(int id, char* data);
+func = capl.GetFunction("sendDiagRequest")
+func.Call(0x7DF, "0123456789ABCDEF")
+
+# ... do other work ...
+
+# Stop measurement
+if measurement.Running:
+    measurement.Stop()
+    while measurement.Running:
+        time.sleep(0.1)
+
+print("Measurement stopped.")
