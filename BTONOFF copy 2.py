@@ -1,15 +1,8 @@
 # -*- coding: utf-8 -*-
-"""
-Bluetooth stress test and multi-device serial logging (revised).
-Key fixes:
-- QNX fault detection: stop if EITHER fault file exists.
-- QNX command sending: send ONE command per write, terminated with '\r' (as in your working script).
-- showmem collection: sequential commands with confirmation markers.
-- Reader/writer: normalize newline handling for reliable pattern matching.
-"""
-
 from __future__ import annotations
-from datetime import datetime
+
+import builtins
+import json
 import os
 import platform
 import re
@@ -17,53 +10,135 @@ import subprocess
 import threading
 import time
 from collections import deque
-from typing import Optional, Pattern
+from datetime import datetime
+from typing import Optional, Pattern, Dict, List
 
 import serial
 from serial import SerialException
 
-import builtins
-from datetime import datetime
+# =============================================================================
+# Configuration (flexible defaults; override via TEST_CONFIG JSON at runtime)
+# =============================================================================
+_run_ts = datetime.now().strftime("%m%d_%H%M%S")
 
-
-
-
-# ---------------------------
-# Constants & Config
-# ---------------------------
-UCOM_COM_PORT = "COM22"
-QNX_COM_PORT  = "COM3"
-SAIL_COM_PORT = "COM14"
-ANDROID_COM_PORT = "COM12"
-
-DEFAULT_BAUD = 115200
-READ_TIMEOUT_SEC = 1.0
-
-LOG_DIR = "logs"
+LOG_DIR = f"logs_{_run_ts}"
 os.makedirs(LOG_DIR, exist_ok=True)
 
-POST_CYCLE_WAIT_SEC = 30  # required: 15 seconds after each cycle
+DEFAULT_CONFIG = {
+    "init_commands": [
+        'echo apibtdump > /dev/displaylog0',
+        'echo apibtdump > /dev/displaylog1',
+        # 'slog2info',
+        'mount -uw /mnt',
+        'chmod -R 755 /mnt/usr/otadata_2/',   
+        'dumper -U dumper -v -d /data -n',    
+    ],
+    "monitored_files": [
+        "/var/log/display_smmu_fault_info.txt",
+        "/var/log/postmortem_smmu.txt",
+        "/var/log/openwfd_server-QM.core",
+        "/data/openwfd_server-QM.core",    
+        # '/var/log/display_recovery_info.txt', # NEW
+    ],
+    "core_path": "/var/log/openwfd_server-QM.core",
+    "core_dest": "/data/",  # absolute destination on QNX
+    "serial": {
+        "ucom": "ttyUSB0",
+        "qnx": "ttyUSB1", 
+        "sail": "ttyUSB2",
+        "android": "ttyUSB3",
+        "baud": 115200,
+        "read_timeout_sec": 1.0,
+    },
+    "local_dirs": {
+        "showmem": os.path.join(LOG_DIR, "showmem"),
+        "showmem_s": os.path.join(LOG_DIR, "showmem_s"),
+        "fault_files": os.path.join(LOG_DIR, "fault_files"),
+    },
+    # --- ADD inside DEFAULT_CONFIG ---
+    "features": {
+        "collect_showmem": True,          # stream showmem / showmem -s to PC
+        "pull_fault_files": True,         # pull (cat) text fault files to PC
+        "copy_core": True,  
+        "print_ls_la": True,
+        "surface_dump_on_fault": False,    # echo surfacedump when fault detected
+        "print_ls_paths_on_fault": ["/var/log"],
+        # --- NEW ---
+        "stop_on_fault": True,            # set True to enable auto-stop on fault
+        "stop_after_fault_wait_sec": 3600     # wait seconds after 
 
-# ---------------------------
-# Utility: subprocess wrapper
-# ---------------------------
-RESULT_OK = 0
-RESULT_NG = 1
-RESULT_TO = 2
+    },
+    "post_cycle_wait_sec": 20,
+}
 
 
-# Per-run log file for all print outputs (with timestamp)
+def _load_config() -> Dict:
+    """Load external JSON config pointed by TEST_CONFIG env var and merge with defaults."""
+    cfg = dict(DEFAULT_CONFIG)
+    path = os.environ.get("TEST_CONFIG", "").strip()
+    if path:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                user_cfg = json.load(f)
+            # Shallow merge with defaults
+            for k, v in user_cfg.items():
+                if isinstance(v, dict) and isinstance(cfg.get(k), dict):
+                    cfg[k].update(v)
+                else:
+                    cfg[k] = v
+            print(f"[CFG] Loaded config from {path}")
+        except Exception as e:
+            print(f"[CFG][WARN] Could not load TEST_CONFIG {path}: {e}")
+    return cfg
+
+
+CFG = _load_config()
+FEAT = CFG.get("features", {})
+FEAT_COLLECT_SHOWMEM        = bool(FEAT.get("collect_showmem", True))
+FEAT_PULL_FAULT_FILES       = bool(FEAT.get("pull_fault_files", True))
+FEAT_COPY_CORE              = bool(FEAT.get("copy_core", True))
+FEAT_SURFACE_DUMP_ON_FAULT  = bool(FEAT.get("surface_dump_on_fault", True))
+FEAT_STOP_ON_FAULT = bool(FEAT.get("stop_on_fault", False))
+FEAT_STOP_AFTER_FAULT_WAIT_SEC = int(FEAT.get("stop_after_fault_wait_sec", 5))
+
+FEAT_PRINT_LS_PATHS_ON_FAULT = FEAT.get("print_ls_paths_on_fault", ["/var/log", "/data"])
+# =============================================================================
+# Constants (from config)
+# =============================================================================
+UCOM_COM_PORT = CFG["serial"]["ucom"]
+QNX_COM_PORT = CFG["serial"]["qnx"]
+SAIL_COM_PORT = CFG["serial"]["sail"]
+ANDROID_COM_PORT = CFG["serial"]["android"]
+DEFAULT_BAUD = CFG["serial"]["baud"]
+READ_TIMEOUT_SEC = CFG["serial"]["read_timeout_sec"]
+
+LOCAL_DIR_SHOW = CFG["local_dirs"]["showmem"]
+LOCAL_DIR_SHOW_S = CFG["local_dirs"]["showmem_s"]
+LOCAL_DIR_FAULTS = CFG["local_dirs"]["fault_files"]
+
+INIT_COMMANDS: List[str] = CFG["init_commands"]
+MONITORED_FILES: List[str] = CFG["monitored_files"]
+CORE_PATH: str = CFG["core_path"]
+CORE_DEST: str = CFG["core_dest"]
+
+POST_CYCLE_WAIT_SEC = CFG["post_cycle_wait_sec"]
+
+# Ensure local save dirs exist
+for d in (LOCAL_DIR_SHOW, LOCAL_DIR_SHOW_S, LOCAL_DIR_FAULTS):
+    os.makedirs(d, exist_ok=True)
+
+# =============================================================================
+# Unified logging of print to testflow_<ts>.txt
+# =============================================================================
 _run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 _testflow_path = os.path.join(LOG_DIR, f"testflow_{_run_ts}.txt")
-
 _original_print = builtins.print
+
 
 def print(*args, **kwargs):
     """Print to console, and also append to logs/testflow_<ts>.txt with timestamp."""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    # console
     _original_print(*args, **kwargs)
-    # file
     try:
         with open(_testflow_path, "a", encoding="utf-8") as f:
             f.write(f"[{ts}] " + " ".join(str(a) for a in args) + "\n")
@@ -71,98 +146,72 @@ def print(*args, **kwargs):
         pass
 
 
-def console_cmd(command_list, timeout: Optional[float] = None):
-    """Run a command via subprocess and capture stdout."""
-    try:
-        proc = subprocess.run(
-            command_list,
-            capture_output=True,
-            text=True,
-            check=True,
-            shell=False,
-            timeout=timeout,
-        )
-        return RESULT_OK, proc.stdout
-    except subprocess.TimeoutExpired:
-        return RESULT_TO, ""
-    except subprocess.CalledProcessError as e:
-        return RESULT_NG, (e.stdout or e.stderr or "")
-def run_and_log(cmd: list[str]):
-    """
-    Run a subprocess command, capture stdout/stderr, and print them
-    so they go to both terminal and testflow log.
-    """
+def run_and_log(cmd: List[str]):
+    """Subprocess wrapper that forwards stdout/stderr to testflow log."""
     try:
         res = subprocess.run(cmd, text=True, capture_output=True, check=False)
-        # Forward stdout/stderr through print() so they get logged
         if res.stdout:
             print(res.stdout.strip())
         if res.stderr:
             print(res.stderr.strip())
     except Exception as e:
         print(f"[Error] run_and_log failed: {cmd} -> {e}")
-# ---------------------------
-# ADB UI sequence 
-# ---------------------------
+
+# =============================================================================
+# ADB UI sequence (unchanged behavior)
+# =============================================================================
 def BT_ONOFF(adb_path: str = "adb"):
     # 1. AllApps画面表示
     run_and_log([adb_path, "shell", "input", "tap", "1014", "1157"])
-
     # 2. Swipe to expose Settings icon
     run_and_log([adb_path, "shell", "input", "swipe", "1500", "600", "700", "600", "300"])
     time.sleep(2)
-
     # Tap Settings app
     run_and_log([adb_path, "shell", "input", "tap", "1200", "325"])
-    time.sleep(3)
-
+    time.sleep(2)
     # 3. Connections画面表示
     run_and_log([adb_path, "shell", "input", "tap", "150", "750"])
     time.sleep(2)
-
     # Bluetooth OFF by command
     run_and_log([adb_path, "shell", "cmd", "bluetooth_manager", "disable"])
-    time.sleep(5)
-
+    time.sleep(10)
     # Navigate (example tap)
     run_and_log([adb_path, "shell", "input", "tap", "970", "290"])
-    time.sleep(5)
-
+    time.sleep(2)
     # "+Add"画面表示
     run_and_log([adb_path, "shell", "input", "tap", "1050", "130"])
-    time.sleep(5)
+    time.sleep(10)
     run_and_log([adb_path, "shell", "input", "tap", "890", "230"])
     time.sleep(2)
-
     # Back to Home
     run_and_log([adb_path, "shell", "input", "tap", "900", "1160"])
-
     # Bluetooth ON by command
     run_and_log([adb_path, "shell", "cmd", "bluetooth_manager", "enable"])
     time.sleep(10)
 
-# ---------------------------
-# Serial Worker
-# ---------------------------
+# =============================================================================
+# Serial Worker (reliable reader/writer with in-memory buffer)
+# =============================================================================
 class SerialWorker:
     """
     Threaded serial reader with logging + simple pattern wait support.
     """
+
     def __init__(self, name: str, port_name: str, baudrate: int = DEFAULT_BAUD):
         self.name = name
         self.port_name = port_name
         self.baudrate = baudrate
+
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self.ser: Optional[serial.Serial] = None
 
         self.port_path = self._resolve_port_path(port_name)
 
-        # safe_port = re.sub(r'[^a-zA-Z0-9._\-]', '_', port_name)
         start_ts = datetime.now().strftime("%m%d_%H%M%S")
         self.log_filename = os.path.join(LOG_DIR, f"log_{self.name}_{start_ts}.txt")
 
-        self._buffer = deque(maxlen=2000)
+        self._buffer = deque(maxlen=20000)
         self._buffer_lock = threading.Lock()
 
     def _resolve_port_path(self, port_name: str) -> str:
@@ -182,10 +231,11 @@ class SerialWorker:
         except SerialException as e:
             print(f"[{self.name}] ERROR opening {self.port_path}: {e}")
             return
+
         self._thread = threading.Thread(target=self._reader_loop, daemon=True)
         self._thread.start()
         print(f"[{self.name}] Reader thread started; logging to {self.log_filename}")
-
+    
     def stop(self):
         """Signal stop and close resources."""
         self._stop_event.set()
@@ -198,6 +248,9 @@ class SerialWorker:
                 pass
         print(f"[{self.name}] Stopped.")
 
+    def get_serial(self):
+        return self.ser
+    
     def _reader_loop(self):
         """Read lines from serial and append to log + buffer."""
         try:
@@ -207,12 +260,11 @@ class SerialWorker:
                         line = self.ser.readline()
                         if not line:
                             continue
-                        # Normalize CRLF to '\n' and drop trailing newline
                         decoded_line = (
                             line.decode("utf-8", errors="replace")
-                                .replace("\r\n", "\n")
-                                .replace("\r", "\n")
-                                .rstrip("\n")
+                            .replace("\r\n", "\n")
+                            .replace("\r", "\n")
+                            .rstrip("\n")
                         )
                         if decoded_line:
                             ts = datetime.now().strftime("%m-%d %H:%M:%S")
@@ -238,22 +290,23 @@ class SerialWorker:
         if not self.ser or not self.ser.is_open:
             print(f"[{self.name}] Cannot send; serial not open")
             return False
-        cmd = text + "\r"   # match suspend_resume_test's style
+        cmd = text + "\r"  # one command per write (CR)
         try:
             self.ser.write(cmd.encode("utf-8"))
         except Exception as e:
             print(f"[{self.name}] Write error: {e}")
             return False
+
         ts = datetime.now().strftime("%m-%d %H:%M:%S")
         try:
             with open(self.log_filename, "a", encoding="utf-8") as f:
                 f.write(f"[{ts}] >> {text} {run_info}\n")
         except Exception as e:
             print(f"[{self.name}] Log write error: {e}")
-        print(f"[{self.name}] SENT: {text!r} {run_info}")
+        # print(f"[{self.name}] SENT: {text!r} {run_info}")
         return True
 
-    def wait_for_pattern(self, pattern: Pattern[str], timeout: float = 5.0) -> bool:
+    def wait_for_pattern(self, pattern: Pattern[str], timeout: float = 10.0) -> bool:
         """Wait until a line matching 'pattern' appears within timeout."""
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -264,21 +317,37 @@ class SerialWorker:
             time.sleep(0.1)
         return False
 
-# ---------------------------
-# QNX helpers
-# ---------------------------
-def qnx_echo_tag(qnx: SerialWorker, tag: str):
-    qnx.send_command(f'echo "__TAG__ {tag}"')
+# =============================================================================
+# QNX helpers: single generic capture (no duplication), probes, and artifacts
+# =============================================================================
+def qnx_ls(qnx: SerialWorker, path: str, flags: str = "la", timeout: float = 8.0) -> bool:
+    """
+    Print-only directory listing using qnx_capture (no file saved).
+    Example: qnx_ls(qnx, "/var/log"), qnx_ls(qnx, "/data", "l").
+    """
+    tag = f"ls {flags} {path}"
+    emit_cmd = f'ls -{flags} "{path}"'
+    return qnx_capture(
+        qnx=qnx,
+        tag=tag,
+        emit_cmd=emit_cmd,
+        local_path=None,                # print-only
+        idle_timeout=timeout,
+        check_exists_path=path,
+        filter_nslog=True,
+    )
 
-def qnx_path_exists(qnx: SerialWorker, path: str, timeout: float = 5.0) -> bool:
+
+def qnx_path_exists(qnx: SerialWorker, path: str, timeout: float = 10.0) -> bool:
     """
-    Return True if 'path' exists on QNX by probing with ls.
-    Uses the same single-command-per-write style as your other script.
+    Return True if 'path' exists on QNX by probing with 'ls'.
+    Prints EXISTS/MISSING with a unique tag to avoid cross-cycle confusion.
     """
+    
     qnx.clear_buffer()
     tag = datetime.now().strftime("%m%d_%H%M%S")
     qnx.send_command(
-        f'if ls {path} >/dev/null 2>&1; then echo "__EXISTS__ {tag}"; else echo "__MISSING__ {tag}"; fi',
+        f'if ls "{path}" >/dev/null 2>&1; then echo "__EXISTS__ {tag}"; else echo "__MISSING__ {tag}"; fi',
         run_info="[EXISTS?]"
     )
     pat_ok = re.compile(rf"__EXISTS__\s+{re.escape(tag)}")
@@ -288,82 +357,319 @@ def qnx_path_exists(qnx: SerialWorker, path: str, timeout: float = 5.0) -> bool:
     while time.time() < deadline:
         with qnx._buffer_lock:
             for ln in reversed(qnx._buffer):
-                if pat_ok.search(ln):
+                s = ln.strip()
+                if pat_ok.search(s):
+                    # print(f"[QNX] EXISTS: {path} ({tag})")
                     return True
-                if pat_ng.search(ln):
+                if pat_ng.search(s):
+                    # print(f"[QNX] MISSING: {path} ({tag})")
                     return False
         time.sleep(0.1)
-    # If we cannot confirm, assume missing to avoid false positives
+    print(f"[QNX] UNKNOWN (timeout): {path} ({tag})")
     return False
 
-def qnx_clear_old_showmem(qnx: SerialWorker):
-    """
-    Remove previous showmem files on QNX side.
-    """
-    # delete both patterns; ignore errors if nothing exists
-    qnx.send_command('rm -f /var/log/showmem_*.txt /var/log/showmem_s_*.txt', run_info='[CLEAN]')
-    time.sleep(0.2)
-    # optional: marker so you can see the cleanup happened
-    qnx.send_command('echo "__CLEARED__ SHOWMEM"', run_info='[CLEAN]')
 
-def qnx_fault_detect(qnx: SerialWorker, timeout: float = 5.0) -> bool:
+def qnx_capture(
+    qnx: SerialWorker,
+    tag: str,
+    emit_cmd: str,
+    local_path: Optional[str],         # allow None for print-only mode
+    idle_timeout: float = 12.0,
+    check_exists_path: Optional[str] = None,
+    filter_nslog: bool = True,
+) -> bool:
     """
-    Stop test if EITHER fault file exists.
-    (Fix for the 'ls two files together' problem.)
+    Generic capture to PC/console:
+      - BEGIN/END markers using 'tag'.
+      - If 'check_exists_path' is given, skip and emit MISSING when absent.
+      - Save payload lines to 'local_path' when provided; if None, print-only.
     """
-    f1 = "/var/log/display_smmu_fault_info.txt"
-    f2 = "/var/log/postmortem_smmu.txt"
-    # Check independently and combine with OR
-    found = qnx_path_exists(qnx, f1, timeout=timeout) or qnx_path_exists(qnx, f2, timeout=timeout)
-    return found
-
-def qnx_init(qnx: SerialWorker):
-    """
-    Called once at test start; set display logging and collect initial memory logs.
-    """
-    qnx_clear_old_showmem(qnx)
-    qnx.send_command('echo apibtdump > /dev/displaylog0', run_info="[INIT set displaylog0]")
-    qnx.send_command('echo apibtdump > /dev/displaylog1', run_info="[INIT set displaylog1]")
-    qnx_collect_memorylog(qnx, flag="init")
-
-#
-def qnx_collect_memorylog(qnx: SerialWorker, flag: str = "fault", cycle: int | None = None):
-    """
-    Collect showmem logs on QNX side using HOST time (MMDD_HHMMSS).
-    'flag' indicates context (e.g., init / ok / error / periodic).
-    'cycle' optionally tags the files with the cycle number.
-    """
-    ts = datetime.now().strftime("%m%d_%H%M%S")  # HOST timestamp
-    suffix = f"cycle{cycle:04d}_{flag}" if cycle is not None else flag
-    f1 = f"/var/log/showmem_{ts}_{suffix}.txt"
-    f2 = f"/var/log/showmem_s_{ts}_{suffix}.txt"
+    nslog_pat = re.compile(r'^\[NSLog\].*')
+    # Match typical syslog timestamps like "Jan 12 07:32:01"
+    # contains_noise_pat = re.compile(r'(JAN|SEP)', re.IGNORECASE)
+    pat_begin = re.compile(r'^__BEGIN__\s+(.+)$')
+    pat_end   = re.compile(r'^__END__\s+(.+)$')
+    pat_miss  = re.compile(r'^__MISSING__\s+(.+)$')
 
     qnx.clear_buffer()
-    # send sequential commands (one-line each)
-    qnx.send_command(f'showmem > "{f1}"', run_info="[MEMLOG]")
-    time.sleep(0.2)
-    qnx.send_command(f'showmem -s > "{f2}"', run_info="[MEMLOG]")
-    time.sleep(0.2)
-    qnx.send_command(f'echo "__MEMLOG__ {f1} {f2} {flag}"', run_info="[MEMLOG]")
-
-    ok1 = qnx_path_exists(qnx, f1, timeout=5.0)
-    ok2 = qnx_path_exists(qnx, f2, timeout=5.0)
-    if ok1 and ok2:
-        print(f"[QNX] showmem collected: {f1}, {f2} ({flag})")
+    if check_exists_path:
+        wrapped = (
+            f'if ls "{check_exists_path}" >/dev/null 2>&1; then '
+            f'echo "__BEGIN__ {tag}"; {emit_cmd}; echo "__END__ {tag}"; '
+            f'else echo "__MISSING__ {tag}"; fi'
+        )
     else:
-        print(f"[QNX] showmem collection FAILED ({flag}). Exists? f1={ok1}, f2={ok2}")
-# ---------------------------
-# Test controller
-# ---------------------------
+        wrapped = f'echo "__BEGIN__ {tag}"; {emit_cmd}; echo "__END__ {tag}"'
+
+    if not qnx.send_command(wrapped, run_info='[CAPTURE]'):
+        print(f"[QNX][ERROR] send_command failed: {wrapped!r}")
+        return False
+
+    current_tag: Optional[str] = None
+    current_lines: List[str] = []
+    next_idx = 0
+    last_activity = time.time()
+
+    while True:
+        with qnx._buffer_lock:
+            buf = list(qnx._buffer)
+        progressed = False
+
+        for s in buf[next_idx:]:
+            sline = s.strip()
+
+            # Missing guard
+            m_miss = pat_miss.match(sline)
+            if m_miss and m_miss.group(1) == tag:
+                print(f"[QNX] MISSING: {tag} (capture skipped)")
+                return False
+
+            # Begin payload
+            m_begin = pat_begin.match(sline)
+            if m_begin and m_begin.group(1) == tag:
+                current_tag = tag
+                current_lines = []
+                progressed = True
+                last_activity = time.time()
+                continue
+
+            # End payload
+            m_end = pat_end.match(sline)
+            if m_end and current_tag and m_end.group(1) == current_tag:
+                # Print-only mode when local_path is None
+                if local_path is None:
+                    for line in current_lines:
+                        if filter_nslog and nslog_pat.match(line):
+                            continue
+                        print(line)
+                    return True
+                # Save-to-file mode
+                try:
+                    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                    with open(local_path, "w", encoding="utf-8") as f:
+                        for ln in current_lines:
+                            if filter_nslog and nslog_pat.match(ln):
+                                continue
+                            f.write(ln + "\n")
+                    print(f"[QNX] Saved: {local_path} ({len(current_lines)} lines)")
+                    return True
+                except Exception as e:
+                    print(f"[QNX][ERROR] Saving {local_path} failed: {e}")
+                    return False
+
+            # Accumulate payload (between BEGIN/END)
+            if current_tag is not None:
+                current_lines.append(s)
+                progressed = True
+                last_activity = time.time()
+
+        next_idx = len(buf)
+
+        if not progressed:
+            if time.time() - last_activity > idle_timeout:
+                # Best-effort print-only when timeout and we have lines
+                if local_path is None and current_tag and current_lines:
+                    print(f"[QNX][WARN] Printed partial ({tag}): {len(current_lines)} lines (timeout)")
+                    return False
+                print(f"[QNX][WARN] Capture idle-timeout for {tag}")
+                return False
+            time.sleep(0.1)
+def qnx_stream_showmem(qnx: SerialWorker, flag: str, cycle: Optional[int]) -> None:
+    """
+    Stream 'showmem' and 'showmem -s' with tags and save to LOCAL_DIR_SHOW/LOCAL_DIR_SHOW_S.
+    Uses qnx_capture() to avoid code duplication.
+    """
+    ts = datetime.now().strftime("%m%d_%H%M%S")
+    suffix = f"cycle{cycle:04d}_{flag}" if cycle is not None else flag
+
+    tag1 = f"/var/log/showmem_{ts}_{suffix}.txt"      # tag only
+    tag2 = f"/var/log/showmem_s_{ts}_{suffix}.txt"    # tag only
+
+    path1 = os.path.join(LOCAL_DIR_SHOW,    os.path.basename(tag1))
+    path2 = os.path.join(LOCAL_DIR_SHOW_S,  os.path.basename(tag2))
+
+    #ok1 = qnx_capture(qnx, tag1, "showmem",   path1, idle_timeout=12.0)
+    # ok2 = qnx_capture(qnx, tag2, "showmem -s", path2, idle_timeout=12.0)
+    qnx_capture(qnx, tag1, "showmem",   path1, idle_timeout=12.0)
+    qnx_capture(qnx, tag2, "showmem -s", path2, idle_timeout=12.0)
+
+  
+
+# --- REPLACE qnx_init(...) tail ---
+def qnx_init(qnx: SerialWorker):
+    for cmd in INIT_COMMANDS:
+        qnx.send_command(cmd, run_info="[INIT]")
+    if FEAT_COLLECT_SHOWMEM:
+        qnx_stream_showmem(qnx, flag="init", cycle=None)
+
+import os
+import re
+from typing import Dict, List
+
+import os
+import re
+import time
+from typing import Dict, List
+
+import os
+import re
+import time
+import glob
+from typing import Dict, List
+import os
+import re
+import time
+from typing import Dict, List
+
+def qnx_fault_scan(
+    qnx,                       # kept for compatibility; not used in log scan
+    files: List[str],
+    timeout: float = 5.0,
+    tail_lines: int = 1000
+) -> Dict[str, bool]:
+    """
+    Minimal-change version:
+      - Keeps the original name/signature used by run_cycle().
+      - Uses the already-defined global `_testflow_path` to read testflow logs.
+      - Scans the last `tail_lines` lines for each file's BASENAME, counted only
+        when it does NOT have a leading '/' (i.e., not part of a path).
+      - Returns {original_path: True/False} and prints a compact summary.
+    """
+    start = time.time()
+    statuses: Dict[str, bool] = {}
+
+    # --- Use the global testflow path your script already defines
+    try:
+        testflow_path = _testflow_path  # defined earlier in bluetoothonoff.py
+    except NameError:
+        print("[QNX] `_testflow_path` is not defined.")
+        return {p: False for p in files}
+
+    # --- Ensure testflow.txt exists
+    if not isinstance(testflow_path, (str, bytes, os.PathLike)) or not os.path.isfile(testflow_path):
+        print(f"[QNX] testflow.txt not found: {testflow_path}")
+        return {p: False for p in files}
+
+    # --- Read only the last N lines; lowercase for case-insensitive matching
+    try:
+        with open(testflow_path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+        tail_text = "\n".join(lines[-tail_lines:]).lower()
+    except Exception as e:
+        print(f"[QNX] Read error for {testflow_path}: {e}")
+        return {p: False for p in files}
+
+    # Timeout check after I/O
+    if timeout and (time.time() - start) >= timeout:
+        print("[QNX] Fault scan (from testflow): TIMEOUT during file read")
+        return {p: False for p in files}
+
+    # --- Build regex patterns for each BASENAME (ignore paths)
+    basenames = {p: os.path.basename(p).lower() for p in files}
+    patterns: Dict[str, re.Pattern] = {}
+
+    for p, bn in basenames.items():
+        escaped = re.escape(bn)
+        # Match bn only when NOT preceded by '/' and not part of a larger filename token:
+        #   (?<!/)                   -> no slash immediately before (so paths don't count)
+        #   (?<![A-Za-z0-9._-])     -> token boundary on the left
+        #   {escaped}               -> the basename
+        #   (?![A-Za-z0-9._-])      -> token boundary on the right
+        patterns[p] = re.compile(rf"(?<!/)(?<![A-Za-z0-9._-]){escaped}(?![A-Za-z0-9._-])")
+
+    # --- Evaluate presence per original path with timeout checks
+    for i, (p, pat) in enumerate(patterns.items()):
+        if timeout and (time.time() - start) >= timeout:
+            for remaining in list(patterns.keys())[i:]:
+                statuses.setdefault(remaining, False)
+            print("[QNX] Fault scan (from testflow): TIMEOUT during checks")
+            break
+        statuses[p] = bool(pat.search(tail_text))
+
+    # --- Print a compact summary (same style as before)
+    summary = ", ".join(f"{p}={'FOUND' if ok else 'NOT FOUND'}" for p, ok in statuses.items())
+    print(f"[QNX] Fault scan: {summary}")
+
+    return statuses
+
+def qnx_process_artifacts(qnx: SerialWorker, statuses: Dict[str, bool], cycle_idx: int):
+    """
+    Handle artifacts once per cycle:
+      - Pull text fault files (EXISTS) if enabled
+      - Move core to CORE_DEST (EXISTS) if enabled
+      - Stream showmem once (error/ok) if enabled
+    """
+    # 1) Pull text fault files (exclude core) if enabled
+    if FEAT_PULL_FAULT_FILES:
+        for p, ok in statuses.items():
+            if not ok:
+                continue
+            local_path = os.path.join(LOCAL_DIR_FAULTS, os.path.basename(p))
+            qnx_capture(
+                qnx=qnx,
+                tag=p,
+
+                emit_cmd=f'cat "{p}"; echo',  # << add a plain echo to inject a newline
+                local_path=local_path,
+                idle_timeout=10.0,
+                check_exists_path=p,
+            )
+
+    # 2) Move core to destination if enabled
+# 2) Move/copy whichever core exists to destination (supports multiple core locations)
+    if FEAT_COPY_CORE:
+        core_candidates = [p for p in statuses.keys() if p.endswith(".core")]
+        for core_path in core_candidates:
+            if not statuses.get(core_path, False):
+                continue
+            qnx.clear_buffer()
+            cp_cmd = (
+                f'if ls "{core_path}" >/dev/null 2>&1; then '
+                f'cp "{core_path}" "{CORE_DEST}" && echo "__CORE_COPIED__"; '
+                f'else echo "__CORE_MISSING__"; fi'
+            )
+            qnx.send_command(cp_cmd, run_info='[MOVE CORE]')
+            pat_moved = re.compile(r'^__CORE_COPIED__$')
+            pat_missing = re.compile(r'^__CORE_MISSING__$')
+            t0 = time.time()
+            copied = False
+            while time.time() - t0 < 5.0:
+                with qnx._buffer_lock:
+                    buf = list(qnx._buffer)
+                if any(pat_moved.match(ln.strip()) for ln in buf):
+                    print(f"[QNX] Core copied from {core_path} to {CORE_DEST}.")
+                    copied = True
+                    break
+                if any(pat_missing.match(ln.strip()) for ln in buf):
+                    print(f"[QNX] Core not present at {core_path}; skipped.")
+                    break
+                time.sleep(0.1)
+            if copied:
+                break  # stop after copying the first available core
+
+    # 3) Stream showmem once, choose flag by fault presence if enabled
+    if FEAT_COLLECT_SHOWMEM:
+        fault_present = any(statuses.values())
+        qnx_stream_showmem(qnx, flag=("error" if fault_present else "ok"), cycle=cycle_idx)
+ # 4) Print directory listings for quick visual confirmation (console + testflow)
+# 4) Print directory listings for quick visual confirmation (console + testflow)
+    for p in FEAT_PRINT_LS_PATHS_ON_FAULT:
+        try:
+            qnx_ls(qnx, p, flags="la", timeout=8.0)
+        except Exception as e:
+            print(f"[QNX][WARN] ls print failed for {p}: {e}")
+# =============================================================================
+# Test controller 
+# =============================================================================
 class TestController:
     def __init__(self, adb_path: str = "adb"):
         self.devices = {
             "UCOM": UCOM_COM_PORT,
-            "QNX":  QNX_COM_PORT,
+            "QNX": QNX_COM_PORT,
             "SAIL": SAIL_COM_PORT,
             "ANDROID": ANDROID_COM_PORT,
         }
-        self.workers: dict[str, SerialWorker] = {}
+        self.workers: Dict[str, SerialWorker] = {}
         self.adb_path = adb_path
 
         self.start_time: Optional[float] = None
@@ -371,6 +677,9 @@ class TestController:
         self.cycles_completed: int = 0
         self.faults_detected: int = 0
         self.stop_reason: str = "completed"
+
+        # Guard to ensure artifacts are processed once per cycle
+        self._artifacts_done_cycle: Optional[int] = None
 
     def start_workers(self):
         for name, port in self.devices.items():
@@ -390,35 +699,59 @@ class TestController:
             print("[Init] QNX worker not available (fault checks will be skipped).")
 
     def run_cycle(self, cycle_idx: int) -> bool:
-        """Run one cycle: execute BT_ONOFF() and check QNX for fault."""
-        # (keep your "[Main] Cycle #..." print wherever you decided)
-        BT_ONOFF(self.adb_path)
-
         qnx = self.workers.get("QNX")
+
+        try:
+            BT_ONOFF(self.adb_path)
+        except Exception as e:
+            print(f"[Cycle] BT_ONOFF error on cycle #{cycle_idx}: {e}")
+            # Print directory listings (ls -la) for /var/log and /data before existence checks
+        try:
+            qnx_ls(qnx, "/var/log", flags="la", timeout=12.0)  # directory listing
+            time.sleep(3)
+            qnx_ls(qnx, "/var/data",    flags="la", timeout=12.0)  # directory listing
+        except Exception as e:
+            print(f"[QNX][WARN] precheck ls -la failed: {e}")
+
+        statuses = {}
+        fault = False
         if qnx:
-            fault = qnx_fault_detect(qnx, timeout=5.0)
-            if fault:
-                qnx.send_command('echo surfacedump=0xFF > /dev/displaylog', run_info="[surface dump]")
+            try:
+                statuses = qnx_fault_scan(qnx, MONITORED_FILES, timeout=5.0)
+                fault = any(statuses.values())
+            except Exception as e:
+                print(f"[Cycle] qnx_fault_scan error on cycle #{cycle_idx}: {e}")
+
+        # --- Fault branch (unchanged) ---
+        if fault:
+            if FEAT_SURFACE_DUMP_ON_FAULT:
+                qnx.send_command('echo surfacedump=0xFF > /dev/displaylog0', run_info="[surface dump]")
+                qnx.send_command('echo surfacedump=0xFF > /dev/displaylog1', run_info="[surface dump]")
                 time.sleep(1)
-                print("[Cycle] Fault detected on QNX! Stopping test.")
-                self.faults_detected += 1
+            print("[Cycle] Fault detected on QNX!")
+            self.faults_detected += 1
+
+            # Process artifacts ONCE per cycle
+            if self._artifacts_done_cycle != cycle_idx:
+                qnx_process_artifacts(qnx, statuses, cycle_idx)
+                self._artifacts_done_cycle = cycle_idx
+
+            if FEAT_STOP_ON_FAULT:
+                wait_s = max(0, FEAT_STOP_AFTER_FAULT_WAIT_SEC)
+                if wait_s:
+                    print(f"[Cycle] Stopping in {wait_s} second(s) after fault …")
+                    time.sleep(wait_s)
                 self.stop_reason = "fault_detected"
-                # ***** CHANGE THIS LINE (add cycle and 'error') *****
-                qnx_collect_memorylog(qnx, flag="error", cycle=cycle_idx)
-                time.sleep(1)
                 return True
-            else:
-                print("[Cycle] No fault detected on QNX.")
-                # ***** ADD THIS LINE (collect at end of a normal cycle) *****
-                qnx_collect_memorylog(qnx, flag="ok", cycle=cycle_idx)
-        else:
-            print("[Cycle] QNX worker not available; skipping fault check.")
 
-        time.sleep(POST_CYCLE_WAIT_SEC)
+        # --- NEW: showmem every cycle regardless of fault ---
+        if qnx and FEAT_COLLECT_SHOWMEM:
+            qnx_stream_showmem(qnx, flag=("error" if fault else "ok"), cycle=cycle_idx)
+
         return False
-
+    
     def run(self):
-        """Run infinite cycles until a fault is detected or user presses Ctrl+C."""
+        """Run infinite cycles until user presses Ctrl+C."""
         self.start_time = time.time()
         self.start_workers()
         print("[Main] Workers started. Beginning INIT …")
@@ -427,9 +760,7 @@ class TestController:
         cycle_idx = 1
         try:
             while True:
-                
                 print(f"[Main] Cycle #{cycle_idx}")
-
                 should_stop = self.run_cycle(cycle_idx)
                 if should_stop:
                     break
@@ -445,7 +776,7 @@ class TestController:
 
     def _print_summary(self):
         start_dt = datetime.fromtimestamp(self.start_time) if self.start_time else None
-        end_dt   = datetime.fromtimestamp(self.end_time) if self.end_time else None
+        end_dt = datetime.fromtimestamp(self.end_time) if self.end_time else None
         duration_sec = int((self.end_time - self.start_time)) if (self.start_time and self.end_time) else 0
         hh = duration_sec // 3600
         mm = (duration_sec % 3600) // 60
@@ -462,20 +793,18 @@ class TestController:
         summary_text += f"Stop reason: {self.stop_reason}\n"
         summary_text += "========================\n"
 
-        # keep terminal output
         print(summary_text)
-
-        # also save to a file next to your other logs
         try:
             with open(os.path.join(LOG_DIR, "summary.txt"), "w", encoding="utf-8") as f:
                 f.write(summary_text)
         except Exception as e:
             print(f"[Error] Could not write summary to file: {e}")
 
-# Entrypoint
 def main():
     controller = TestController(adb_path="adb")
     controller.run()
 
+
 if __name__ == "__main__":
     main()
+    

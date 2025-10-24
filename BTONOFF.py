@@ -367,12 +367,12 @@ def qnx_fault_detect(qnx: SerialWorker, timeout: float = 5.0) -> bool:
     Additionally checks /var/log/openwfd_server-QM.core via the same ls-probe mechanism,
     prints all statuses, and moves the core to ~/var when present.
     """
-    # f1 = "/var/log/display_smmu_fault_info.txt"
-    # f2 = "/var/log/postmortem_smmu.txt"
-    # f3 = "/var/log/openwfd_server-QM.core"
-    f1 = "f1.txt "
-    f2 = "f2.txt" 
-    f3 = "f3.txt"
+    f1 = "/var/log/display_smmu_fault_info.txt"
+    f2 = "/var/log/postmortem_smmu.txt"
+    f3 = "/var/log/openwfd_server-QM.core"
+    # f1 = "f1.txt "
+    # f2 = "f2.txt" 
+    # f3 = "f3.txt"
 
     # Existence checks (each prints its own result via qnx_path_exists)
     ok1 = qnx_path_exists(qnx, f1, timeout=timeout)

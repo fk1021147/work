@@ -28,19 +28,24 @@ DEFAULT_CONFIG = {
     "init_commands": [
         'echo apibtdump > /dev/displaylog0',
         'echo apibtdump > /dev/displaylog1',
+        'slog2info',
+        'mount -uw /mnt',
+        'chmod -R 755 /mnt/usr/otadata_2/',   
+        'dumper -U dumper -v -d /data -n',    
     ],
     "monitored_files": [
         "/var/log/display_smmu_fault_info.txt",
         "/var/log/postmortem_smmu.txt",
         "/var/log/openwfd_server-QM.core",
+        "/data/openwfd_server-QM.core",     # NEW
     ],
     "core_path": "/var/log/openwfd_server-QM.core",
     "core_dest": "/data/",  # absolute destination on QNX
     "serial": {
-        "ucom": "COM22",
-        "qnx": "COM13",
-        "sail": "COM3",
-        "android": "COM12",
+        "ucom": "COM12",
+        "qnx": "COM14",
+        "sail": "COM22",
+        "android": "COM3",
         "baud": 115200,
         "read_timeout_sec": 1.0,
     },
@@ -55,12 +60,12 @@ DEFAULT_CONFIG = {
         "pull_fault_files": True,         # pull (cat) text fault files to PC
         "copy_core": True,  
         "print_ls_la": True,
-        "surface_dump_on_fault": True,    # echo surfacedump when fault detected
-        "print_ls_paths_on_fault": ["/var/log", "/var/data","/dev/shmem/"],
+        "surface_dump_on_fault": False,    # echo surfacedump when fault detected
+        "print_ls_paths_on_fault": ["/var/log"],
         # --- NEW ---
         "stop_on_fault": True,            # set True to enable auto-stop on fault
-        "stop_after_fault_wait_sec": 80     # wait seconds after 
-        
+        "stop_after_fault_wait_sec": 3600     # wait seconds after 
+
     },
     "post_cycle_wait_sec": 10,
 }
@@ -205,7 +210,7 @@ class SerialWorker:
         start_ts = datetime.now().strftime("%m%d_%H%M%S")
         self.log_filename = os.path.join(LOG_DIR, f"log_{self.name}_{start_ts}.txt")
 
-        self._buffer = deque(maxlen=2000)
+        self._buffer = deque(maxlen=200000)
         self._buffer_lock = threading.Lock()
 
     def _resolve_port_path(self, port_name: str) -> str:
@@ -300,7 +305,7 @@ class SerialWorker:
         # print(f"[{self.name}] SENT: {text!r} {run_info}")
         return True
 
-    def wait_for_pattern(self, pattern: Pattern[str], timeout: float = 5.0) -> bool:
+    def wait_for_pattern(self, pattern: Pattern[str], timeout: float = 10.0) -> bool:
         """Wait until a line matching 'pattern' appears within timeout."""
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -335,6 +340,19 @@ def qnx_path_exists(qnx: SerialWorker, path: str, timeout: float = 5.0) -> bool:
     Return True if 'path' exists on QNX by probing with 'ls'.
     Prints EXISTS/MISSING with a unique tag to avoid cross-cycle confusion.
     """
+    
+    try:
+        qnx_capture(
+            qnx=qnx,
+            tag=f"precheck_ls_{os.path.basename(path)}",
+            emit_cmd=f'ls "{path}"',
+            local_path=None,            # print-only to console/testflow
+            idle_timeout=5.0,
+            check_exists_path=path,     # avoids spewing errors if missing
+        )
+    except Exception as e:
+        print(f"[QNX][WARN] precheck ls failed for {path}: {e}")
+
     qnx.clear_buffer()
     tag = datetime.now().strftime("%m%d_%H%M%S")
     qnx.send_command(
@@ -425,15 +443,10 @@ def qnx_capture(
             m_end = pat_end.match(sline)
             if m_end and current_tag and m_end.group(1) == current_tag:
                 # Print-only mode when local_path is None
-                if local_path is None and (
-                    "ls la" in tag or
-                    "display_smmu_fault_info.txt" in tag or
-                    "postmortem_smmu.txt" in tag
-                ):  
-                    print(emit_cmd)
-                    for ln in current_lines:
-                        print(ln)
-                    return True                   
+                if local_path is None:
+                    for line in current_lines:
+                        print(line)
+                    return True
                 # Save-to-file mode
                 try:
                     os.makedirs(os.path.dirname(local_path), exist_ok=True)
@@ -442,7 +455,7 @@ def qnx_capture(
                             if filter_nslog and nslog_pat.match(ln):
                                 continue
                             f.write(ln + "\n")
-                    print(f"[QNX] Saved: {local_path})")
+                    print(f"[QNX] Saved: {local_path} ({len(current_lines)} lines)")
                     return True
                 except Exception as e:
                     print(f"[QNX][ERROR] Saving {local_path} failed: {e}")
@@ -471,6 +484,7 @@ def qnx_stream_showmem(qnx: SerialWorker, flag: str, cycle: Optional[int]) -> No
     Stream 'showmem' and 'showmem -s' with tags and save to LOCAL_DIR_SHOW/LOCAL_DIR_SHOW_S.
     Uses qnx_capture() to avoid code duplication.
     """
+    
     ts = datetime.now().strftime("%m%d_%H%M%S")
     suffix = f"cycle{cycle:04d}_{flag}" if cycle is not None else flag
 
@@ -480,7 +494,7 @@ def qnx_stream_showmem(qnx: SerialWorker, flag: str, cycle: Optional[int]) -> No
     path1 = os.path.join(LOCAL_DIR_SHOW,    os.path.basename(tag1))
     path2 = os.path.join(LOCAL_DIR_SHOW_S,  os.path.basename(tag2))
 
-    # ok1 = qnx_capture(qnx, tag1, "showmem",   path1, idle_timeout=12.0)
+    #ok1 = qnx_capture(qnx, tag1, "showmem",   path1, idle_timeout=12.0)
     # ok2 = qnx_capture(qnx, tag2, "showmem -s", path2, idle_timeout=12.0)
     qnx_capture(qnx, tag1, "showmem",   path1, idle_timeout=12.0)
     qnx_capture(qnx, tag2, "showmem -s", path2, idle_timeout=12.0)
@@ -514,57 +528,70 @@ def qnx_process_artifacts(qnx: SerialWorker, statuses: Dict[str, bool], cycle_id
       - Move core to CORE_DEST (EXISTS) if enabled
       - Stream showmem once (error/ok) if enabled
     """
-
-    for p in FEAT_PRINT_LS_PATHS_ON_FAULT:
-        try:
-            qnx_ls(qnx, p, flags="la", timeout=8.0)
-        except Exception as e:
-            print(f"[QNX][WARN] ls print failed for {p}: {e}")
     # 1) Pull text fault files (exclude core) if enabled
     if FEAT_PULL_FAULT_FILES:
         for p, ok in statuses.items():
-            if not ok or p == CORE_PATH:
+            if not ok:
                 continue
-            local_path = os.path.join(LOCAL_DIR_FAULTS, os.path.basename(p))
-            qnx_capture(
-                qnx=qnx,
-                tag=p,
+            if p.endswith(".core"):
+                qnx_capture(qnx, tag=p, emit_cmd=f'hexdump -C -n 256 "{p}"', local_path=None, idle_timeout=10.0, check_exists_path=p)
+            else:
 
-                emit_cmd=f'cat "{p}"; echo',  # << add a plain echo to inject a newline
-                local_path=local_path,
-                idle_timeout=10.0,
-                check_exists_path=p,
-            )
+                
+                local_path = os.path.join(LOCAL_DIR_FAULTS, os.path.basename(p))
+                qnx_capture(
+                    qnx=qnx,
+                    tag=p,
+
+                    emit_cmd=f'cat "{p}"; echo',  # << add a plain echo to inject a newline
+                    local_path=local_path,
+                    idle_timeout=10.0,
+                    check_exists_path=p,
+                )
 
     # 2) Move core to destination if enabled
-    if FEAT_COPY_CORE and statuses.get(CORE_PATH, False):
-        qnx.clear_buffer()
-        cp_cmd = (
-            f'if ls {CORE_PATH} >/dev/null 2>&1; then '
-            f'cp {CORE_PATH} {CORE_DEST} && echo "__CORE_COPIED__"; '
-            f'else echo "__CORE_MISSING__"; fi'
-        )
-        qnx.send_command(cp_cmd, run_info='[MOVE CORE]')
-        pat_moved = re.compile(r'^__CORE_COPIED__$')
-        pat_missing = re.compile(r'^__CORE_MISSING__$')
-        t0 = time.time()
-        while time.time() - t0 < 5.0:
-            with qnx._buffer_lock:
-                buf = list(qnx._buffer)
-            if any(pat_moved.match(ln.strip()) for ln in buf):
-                print(f"[QNX] Core copied to {CORE_DEST}.")
-                break
-            if any(pat_missing.match(ln.strip()) for ln in buf):
-                print("[QNX] Core not present; nothing to copy.")
-                break
-            time.sleep(0.1)
+# 2) Move/copy whichever core exists to destination (supports multiple core locations)
+    if FEAT_COPY_CORE:
+        core_candidates = [p for p in statuses.keys() if p.endswith(".core")]
+        for core_path in core_candidates:
+            if not statuses.get(core_path, False):
+                continue
+            qnx.clear_buffer()
+            cp_cmd = (
+                f'if ls "{core_path}" >/dev/null 2>&1; then '
+                f'cp "{core_path}" "{CORE_DEST}" && echo "__CORE_COPIED__"; '
+                f'else echo "__CORE_MISSING__"; fi'
+            )
+            qnx.send_command(cp_cmd, run_info='[MOVE CORE]')
+            pat_moved = re.compile(r'^__CORE_COPIED__$')
+            pat_missing = re.compile(r'^__CORE_MISSING__$')
+            t0 = time.time()
+            copied = False
+            while time.time() - t0 < 5.0:
+                with qnx._buffer_lock:
+                    buf = list(qnx._buffer)
+                if any(pat_moved.match(ln.strip()) for ln in buf):
+                    print(f"[QNX] Core copied from {core_path} to {CORE_DEST}.")
+                    copied = True
+                    break
+                if any(pat_missing.match(ln.strip()) for ln in buf):
+                    print(f"[QNX] Core not present at {core_path}; skipped.")
+                    break
+                time.sleep(0.1)
+            if copied:
+                break  # stop after copying the first available core
 
     # 3) Stream showmem once, choose flag by fault presence if enabled
     if FEAT_COLLECT_SHOWMEM:
         fault_present = any(statuses.values())
         qnx_stream_showmem(qnx, flag=("error" if fault_present else "ok"), cycle=cycle_idx)
  # 4) Print directory listings for quick visual confirmation (console + testflow)
-
+# 4) Print directory listings for quick visual confirmation (console + testflow)
+    for p in FEAT_PRINT_LS_PATHS_ON_FAULT:
+        try:
+            qnx_ls(qnx, p, flags="la", timeout=8.0)
+        except Exception as e:
+            print(f"[QNX][WARN] ls print failed for {p}: {e}")
 # =============================================================================
 # Test controller 
 # =============================================================================
@@ -606,47 +633,49 @@ class TestController:
             print("[Init] QNX worker not available (fault checks will be skipped).")
 
     def run_cycle(self, cycle_idx: int) -> bool:
-        """
-        Run one cycle: execute BT_ONOFF() and perform a unified fault scan.
-        Always returns False so the main loop continues.
-        """
         try:
             BT_ONOFF(self.adb_path)
         except Exception as e:
             print(f"[Cycle] BT_ONOFF error on cycle #{cycle_idx}: {e}")
 
         qnx = self.workers.get("QNX")
+        statuses = {}
+        fault = False
         if qnx:
             try:
                 statuses = qnx_fault_scan(qnx, MONITORED_FILES, timeout=5.0)
                 fault = any(statuses.values())
             except Exception as e:
                 print(f"[Cycle] qnx_fault_scan error on cycle #{cycle_idx}: {e}")
-                statuses = {}
-                fault = False
 
-            # --- REPLACE fault block inside run_cycle(...) ---
+        # --- Fault branch (unchanged) ---
         if fault:
             if FEAT_SURFACE_DUMP_ON_FAULT:
-                qnx.send_command('echo surfacedump=0xFF > /dev/displaylog', run_info="[surface dump]")
-            time.sleep(1)
+                qnx.send_command('echo surfacedump=0xFF > /dev/displaylog0', run_info="[surface dump]")
+                qnx.send_command('echo surfacedump=0xFF > /dev/displaylog1', run_info="[surface dump]")
+                time.sleep(1)
             print("[Cycle] Fault detected on QNX!")
-
             self.faults_detected += 1
 
-            # Process artifacts ONCE per cycle (pull files, move/copy core, showmem, print ls -la)
+            # Process artifacts ONCE per cycle
             if self._artifacts_done_cycle != cycle_idx:
                 qnx_process_artifacts(qnx, statuses, cycle_idx)
                 self._artifacts_done_cycle = cycle_idx
 
-            # --- NEW: optional delayed stop after fault ---
             if FEAT_STOP_ON_FAULT:
                 wait_s = max(0, FEAT_STOP_AFTER_FAULT_WAIT_SEC)
                 if wait_s:
                     print(f"[Cycle] Stopping in {wait_s} second(s) after fault …")
                     time.sleep(wait_s)
                 self.stop_reason = "fault_detected"
-                return True  # <- tells the main loop to exit`
+                return True
+
+        # --- NEW: showmem every cycle regardless of fault ---
+        if qnx and FEAT_COLLECT_SHOWMEM:
+            qnx_stream_showmem(qnx, flag=("error" if fault else "ok"), cycle=cycle_idx)
+
+        return False
+    
     def run(self):
         """Run infinite cycles until user presses Ctrl+C."""
         self.start_time = time.time()
